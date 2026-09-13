@@ -63,6 +63,7 @@ class ChapterHtmlSlimParserTest : public ::testing::TestWithParam<const char*> {
                                0,
                                1.0f,
                                false,
+                               false,
                                0,
                                static_cast<uint16_t>(renderer.getScreenWidth()),
                                static_cast<uint16_t>(renderer.getScreenHeight()),
@@ -82,7 +83,7 @@ class ChapterHtmlSlimParserTest : public ::testing::TestWithParam<const char*> {
     ESP = {};
     collectedFootnotes.clear();
     laidOutWords.clear();
-    parser.currentTextBlock = std::make_unique<ParsedText>(false, false, false, BlockStyle{}, true);
+    parser.currentTextBlock = std::make_unique<ParsedText>(false, false, false, false, BlockStyle{}, true);
   }
   void TearDown() override {
     ESP = {};
@@ -100,7 +101,7 @@ class ChapterHtmlSlimParserTest : public ::testing::TestWithParam<const char*> {
 
 TEST_F(ChapterHtmlSlimParserTest, NoTouchKeepsFootnotesWithoutLinkStorage) {
   parser.collectTouchLinks = false;
-  parser.currentTextBlock = std::make_unique<ParsedText>(false, false, false, BlockStyle{}, false);
+  parser.currentTextBlock = std::make_unique<ParsedText>(false, false, false, false, BlockStyle{}, false);
   const XML_Char* attributes[] = {"href", "#note-target", nullptr};
   ChapterHtmlSlimParser::startElement(&parser, "a", attributes);
   ChapterHtmlSlimParser::characterData(&parser, "1", 1);
@@ -518,7 +519,7 @@ TEST_F(SectionMemoryTest, MixedChapterCacheMatchesVerifiedLayout) {
   append(bytes);
   for (const auto& word : laidOutWords) append(word);
   for (const auto& href : collectedFootnotes) append(href);
-  EXPECT_EQ(digest, 13330287791149729058ULL);  // Pre-refactor cache, text and footnotes.
+  EXPECT_EQ(digest, 14638228299380780641ULL);  // v67 cache (reader first-line-indent toggle), text and footnotes.
 }
 
 TEST_F(SectionMemoryTest, CssCacheOomIsReportedAndBasicBuildDoesNotHydrateCss) {
