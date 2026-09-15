@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
+#include "BookStyleStore.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderActivity.h"
@@ -47,6 +49,45 @@ std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, Ma
 
 void ReaderActivity::applyInitialOrientation() { ReaderUtils::applyOrientation(renderer, SETTINGS.orientation); }
 
+namespace {
+
+BookStyle snapshotStyleFromSettings() {
+  BookStyle style;
+  style.fontFamily = SETTINGS.fontFamily;
+  memcpy(style.sdFontFamilyName, SETTINGS.sdFontFamilyName, sizeof(style.sdFontFamilyName));
+  style.fontPointSize = SETTINGS.fontPointSize;
+  style.lineSpacing = SETTINGS.lineSpacing;
+  style.paragraphAlignment = SETTINGS.paragraphAlignment;
+  style.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+  style.fakeBold = SETTINGS.fakeBold;
+  style.textAntiAliasing = SETTINGS.textAntiAliasing;
+  return style;
+}
+
+void applyStyleToSettings(const BookStyle& style) {
+  SETTINGS.fontFamily = style.fontFamily;
+  memcpy(SETTINGS.sdFontFamilyName, style.sdFontFamilyName, sizeof(SETTINGS.sdFontFamilyName));
+  SETTINGS.fontPointSize = style.fontPointSize;
+  SETTINGS.lineSpacing = style.lineSpacing;
+  SETTINGS.paragraphAlignment = style.paragraphAlignment;
+  SETTINGS.extraParagraphSpacing = style.extraParagraphSpacing;
+  SETTINGS.fakeBold = style.fakeBold;
+  SETTINGS.textAntiAliasing = style.textAntiAliasing;
+}
+
+}  // namespace
+
+void ReaderActivity::applyBookStyle() {
+  BookStyle style;
+  // Books without their own entry keep the global settings from the settings
+  // screen, exactly like the stock firmware behaved.
+  if (!BOOK_STYLES.findStyle(bookPath, style)) return;
+  applyStyleToSettings(style);
+  SETTINGS.saveToFile();
+}
+
+void ReaderActivity::saveBookStyle() { BOOK_STYLES.updateStyle(bookPath, snapshotStyleFromSettings()); }
+
 void ReaderActivity::disableFastInitialRefresh() { pagesUntilFullRefresh = 0; }
 
 void ReaderActivity::notePageTurn(const bool forward, const bool succeeded) {
@@ -73,6 +114,11 @@ void ReaderActivity::onEnter() {
     APP_STATE.saveToFile();
   }
 
+  // Restore this book's own remembered style before the font system and the
+  // render spec are built, so the book opens exactly as it was left. Books
+  // without a remembered style simply keep the global settings.
+  applyBookStyle();
+
   sdFontSystem.ensureLoaded(renderer);
   applyInitialOrientation();
 
@@ -95,6 +141,10 @@ void ReaderActivity::rememberBookOnceRendered() {
 }
 
 void ReaderActivity::onExit() {
+  // Remember the typography this book ended with, both as its own entry and as
+  // the default style for books that have no entry yet.
+  saveBookStyle();
+
   Activity::onExit();
 
   // Keep rebuildable font buffers from pinning the heap between reading sessions.
