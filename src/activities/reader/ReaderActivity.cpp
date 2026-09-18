@@ -59,6 +59,7 @@ BookStyle snapshotStyleFromSettings() {
   style.lineSpacing = SETTINGS.lineSpacing;
   style.paragraphAlignment = SETTINGS.paragraphAlignment;
   style.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+  style.firstLineIndent = SETTINGS.firstLineIndent;
   style.fakeBold = SETTINGS.fakeBold;
   style.textAntiAliasing = SETTINGS.textAntiAliasing;
   style.readingGuideLineEnabled = SETTINGS.readingGuideLineEnabled;
@@ -74,6 +75,7 @@ void applyStyleToSettings(const BookStyle& style) {
   SETTINGS.lineSpacing = style.lineSpacing;
   SETTINGS.paragraphAlignment = style.paragraphAlignment;
   SETTINGS.extraParagraphSpacing = style.extraParagraphSpacing;
+  SETTINGS.firstLineIndent = style.firstLineIndent;
   SETTINGS.fakeBold = style.fakeBold;
   SETTINGS.textAntiAliasing = style.textAntiAliasing;
   SETTINGS.readingGuideLineEnabled = style.readingGuideLineEnabled;
