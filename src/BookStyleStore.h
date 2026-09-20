@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "CrossPointSettings.h"
-#include "FirstLineIndent.h"
+#include <Epub/FirstLineIndent.h>
 
 // Per-book reader typography snapshot. Persisted per book path so a book
 // reopens with exactly the style (font family/size, line spacing, alignment,
