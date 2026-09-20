@@ -32,6 +32,11 @@ constexpr char SETTINGS_FILE_BAK[] = "/.crosspoint/settings.bin.bak";
 constexpr char LANG_FILE_BIN[] = "/.crosspoint/language.bin";
 constexpr char LANG_FILE_BAK[] = "/.crosspoint/language.bin.bak";
 constexpr uint8_t FAKE_BOLD_VERSION = 1;
+// Bumped when extra paragraph spacing changes shape: v1 (stock) stored it as
+// a toggle (1 = 0.5 line); v2 exposes a 7-step enum (0=off, 1=0.25, 2=0.5,
+// 3=0.75, 4=1, 5=1.25, 6=1.5), so a legacy value of 1 is remapped to step 2
+// to preserve the user's 0.5-line spacing on upgrade.
+constexpr uint8_t PARAGRAPH_SPACING_VERSION = 2;
 constexpr std::array<uint8_t, 3> LEGACY_FAKE_BOLD_MIGRATION = {
     CrossPointSettings::SYNTHETIC_BOLD_OFF,
     CrossPointSettings::SYNTHETIC_BOLD_STANDARD,
@@ -239,6 +244,7 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   }
 
   doc["fakeBoldVersion"] = FAKE_BOLD_VERSION;
+  doc["paragraphSpacingVersion"] = PARAGRAPH_SPACING_VERSION;
   // Front button remap — managed by RemapFrontButtons sub-activity, not in SettingsList.
   doc["frontButtonBack"] = frontButtonBack;
   doc["frontButtonConfirm"] = frontButtonConfirm;
@@ -382,6 +388,16 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
         fakeBold = LEGACY_FAKE_BOLD_MIGRATION[legacyFakeBold];
       }
     }
+    needsResave = true;
+  }
+
+  // Paragraph spacing schema migration: stock firmware stored extra paragraph
+  // spacing as a toggle (1 = 0.5 line); v2 exposes a 7-step enum (0=off,
+  // 1=0.25, 2=0.5, ...). Remap a legacy 1 to step 2 so upgrades keep the
+  // user's 0.5-line spacing instead of silently narrowing it to 0.25.
+  if ((doc["paragraphSpacingVersion"] | static_cast<uint8_t>(0)) < PARAGRAPH_SPACING_VERSION &&
+      extraParagraphSpacing == 1) {
+    extraParagraphSpacing = 2;
     needsResave = true;
   }
 
