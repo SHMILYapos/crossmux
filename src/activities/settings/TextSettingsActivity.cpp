@@ -47,9 +47,10 @@ constexpr StrId STYLE_ROW_NAME_IDS[] = {StrId::STR_FOCUS_READING,
                                         StrId::STR_TEXT_AA};
 
 constexpr StrId LINE_SPACING_IDS[] = {StrId::STR_TIGHT, StrId::STR_NORMAL, StrId::STR_WIDE, StrId::STR_EXTRA_WIDE};
-constexpr StrId EXTRA_SPACING_IDS[] = {StrId::STR_EXTRA_SPACING_OFF,  StrId::STR_EXTRA_SPACING_0_5,
-                                       StrId::STR_EXTRA_SPACING_0_75, StrId::STR_EXTRA_SPACING_1,
-                                       StrId::STR_EXTRA_SPACING_1_25, StrId::STR_EXTRA_SPACING_1_5};
+constexpr StrId EXTRA_SPACING_IDS[] = {StrId::STR_EXTRA_SPACING_OFF,  StrId::STR_EXTRA_SPACING_0_25,
+                                       StrId::STR_EXTRA_SPACING_0_5, StrId::STR_EXTRA_SPACING_0_75,
+                                       StrId::STR_EXTRA_SPACING_1, StrId::STR_EXTRA_SPACING_1_25,
+                                       StrId::STR_EXTRA_SPACING_1_5};
 constexpr StrId SYNTHETIC_BOLD_IDS[] = {StrId::STR_STATE_OFF, StrId::STR_FAKE_BOLD_LIGHT, StrId::STR_FAKE_BOLD_STANDARD,
                                         StrId::STR_FAKE_BOLD_HEAVY};
 static_assert(std::size(SYNTHETIC_BOLD_IDS) == CrossPointSettings::SYNTHETIC_BOLD_COUNT);
