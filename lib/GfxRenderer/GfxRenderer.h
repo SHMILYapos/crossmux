@@ -54,6 +54,25 @@ class GfxRenderer {
     return mapTwoBitPixel(mode, 3 - coverage);
   }
 
+  // Export mapping for the single-pass 2-bit frame (values use the glyph
+  // coverage convention 0=white..3=black). Returns whether a pixel with value
+  // `value` participates in the given export plane. This is exactly the
+  // inverse read of mapTwoBitPixel — grayFrameExportBit(mode, v) equals
+  // mapTwoBitPixel(mode, 3 - v).draw — and the framebuffer bit semantics match
+  // the per-mode render too: BW clears the bit (ink), LSB/MSB set it.
+  static constexpr bool grayFrameExportBit(const RenderMode mode, const uint8_t value) {
+    if (mode == BW) return value != 0;  // every non-white pixel is ink
+#if FREEINK_DEVICE_EEGO_A4
+    // A4 plane tables (mapTwoBitPixel values are 0=black..3=white, so the
+    // frame value v participates when 3-v maps to draw).
+    if (mode == GRAYSCALE_MSB) return value == 2 || value == 3;
+    return value == 1 || value == 3;
+#else
+    if (mode == GRAYSCALE_LSB) return value == 2;  // dark gray only
+    return value == 1 || value == 2;               // light or dark gray (MSB)
+#endif
+  }
+
   static constexpr bool framebufferState(const RenderMode mode, const bool state) {
 #if FREEINK_DEVICE_EEGO_A4
     return mode == BW ? state : !state;
@@ -115,6 +134,19 @@ class GfxRenderer {
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
+
+  // Single-pass 2-bit grayscale frame target (reader AA fast path). When
+  // active, drawPixel()/draw2BitGlyphPixel() write a caller-owned
+  // 2-bits-per-pixel frame (0=white, 1=light gray, 2=dark gray, 3=black)
+  // instead of the 1-bit framebuffer. Lets the reader render an anti-aliased
+  // page once and then export the BW base + LSB/MSB gray planes (same
+  // per-pixel mapping table as the classic three-pass render) without walking
+  // the page layout three times. Orthogonal to the strip target: if both are
+  // set the strip check runs first and only in-band pixels reach the 2-bit
+  // frame (the reader never combines them, but the guard is cheap). Mutable
+  // because the render path is const.
+  mutable uint8_t* _gray2BitBuf = nullptr;
+  mutable bool _gray2BitActive = false;
 
   // Logical-coordinate clip rectangle (scissor). When active, drawPixel()
   // silently drops pixels whose *logical* (x, y) falls outside [clipX0, clipX1)
@@ -282,6 +314,46 @@ class GfxRenderer {
   // skip an expensive bitmap decode. Returns true when no strip is active.
   // Corners are rotated to physical, so it is orientation-aware.
   bool glyphIntersectsStrip(int x0, int y0, int x1, int y1) const;
+
+  // --- Single-pass 2-bit grayscale frame (reader AA fast path) ---
+  // While a 2-bit target is active, drawPixel(state) stores 3 (black) / 0
+  // (white) and glyph pixels store their raw 2-bit coverage (0=white,
+  // 1=light gray, 2=dark gray, 3=black). Layout: panelWidth/4 bytes per
+  // physical row, MSB first, 2 bits per pixel — the same packing as the
+  // 2-bit EpdFont glyph bitmaps, so an export is a straight table walk.
+  void begin2BitTarget(uint8_t* buf) const {
+    _gray2BitBuf = buf;
+    _gray2BitActive = true;
+  }
+  void end2BitTarget() const {
+    // Stop routing drawPixel()/draw2BitGlyphPixel() into the 2-bit frame, but
+    // KEEP the buffer pointer: the single-pass AA flow renders into the frame
+    // and then calls exportGrayFrameToBw/Lsb/Msb *after* end2BitTarget()
+    // returns. Nulling the pointer here made every export a no-op (blank text
+    // on AA pages). The pointer is overwritten by the next begin2BitTarget().
+    _gray2BitActive = false;
+  }
+  bool is2BitTargetActive() const { return _gray2BitActive; }
+  static constexpr uint32_t gray2BitRowBytes(const uint16_t width) { return (static_cast<uint32_t>(width) + 3u) / 4u; }
+  void clear2BitTarget(uint8_t value) const;  // memset the whole 2-bit frame
+  // Write one 2-bit pixel (logical coords; rotates and clips like drawPixel).
+  void draw2BitPixel(int x, int y, uint8_t value) const;
+  // Export the 2-bit frame into the 1-bit framebuffer with the same mapping as
+  // the classic per-mode render (see mapTwoBitPixel). BW keeps white pixels
+  // untouched (preserves a background frame already loaded); LSB/MSB first
+  // zero the framebuffer, matching the old clearScreen(0x00) + draw passes.
+  void exportGrayFrameToBw() const;
+  void exportGrayFrameToLsb() const;
+  void exportGrayFrameToMsb() const;
+  // Single-pass export: one walk of the 2-bit frame writes all three planes at
+  // once (BW into the framebuffer with the background preserved, LSB/MSB into
+  // the two caller-provided 47KB buffers), replacing three full-frame walks.
+  // Pixel-identical to exportGrayFrameToBw/Lsb/Msb.
+  void exportGrayFrameToPlanes(uint8_t* lsbBuf, uint8_t* msbBuf) const;
+  // Copy an externally produced LSB/MSB plane (single-pass export) to the
+  // driver, instead of the framebuffer-backed versions above.
+  void copyGrayscaleLsbBuffersFrom(const uint8_t* lsbBuf) const;
+  void copyGrayscaleMsbBuffersFrom(const uint8_t* msbBuf) const;
 
   // Active pixel-write target for raw writers (DirectPixelWriter) that bypass
   // drawPixel for speed. When a strip target is active these return the band

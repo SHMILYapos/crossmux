@@ -54,7 +54,16 @@ void SdCardFontSystem::begin(GfxRenderer& renderer) {
   if (SETTINGS.sdFontFamilyName[0] != '\0') {
     const auto* family = registry_.findFamily(SETTINGS.sdFontFamilyName);
     if (family) {
-      if (manager_.loadFamily(*family, renderer, SETTINGS.fontPointSize, SETTINGS.sdFontFlashPreload != 0)) {
+      // A complete CJK .cpfont needs several hundred KB of contiguous
+      // internal heap (glyph tables, kern classes) and the renderer's font
+      // map insertions are not OOM-guarded. If startup memory cannot safely
+      // cover that, skip loading instead of aborting: the built-in fonts
+      // remain usable and the saved selection is cleared.
+      if (ESP.getFreeHeap() < 160 * 1024) {
+        LOG_ERR("SDFS", "Insufficient heap (%u B) to load SD font %s; using built-in fonts",
+                ESP.getFreeHeap(), SETTINGS.sdFontFamilyName);
+        SETTINGS.clearSdFontFamily();
+      } else if (manager_.loadFamily(*family, renderer, SETTINGS.fontPointSize, SETTINGS.sdFontFlashPreload != 0)) {
         snapFontPointSizeTo(manager_.currentPointSize());
         setupUiFallbacks(renderer);
         LOG_DBG("SDFS", "Loaded SD card font family: %s", SETTINGS.sdFontFamilyName);

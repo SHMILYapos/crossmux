@@ -869,6 +869,27 @@ void EpubReaderActivity::loop() {
   auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
   prevTriggered = prevTriggered || touch.prev;
   nextTriggered = nextTriggered || touch.next;
+
+  // Tap-zone long-press actions: a BOOKMARK/DICTIONARY zone reports once on
+  // finger lift (held >= BOOKMARK_HOLD_MS). touchHoldHandled guards against a
+  // re-report and is re-armed on the next release.
+  if (mappedInput.wasScreenTouchReleased()) {
+    touchHoldHandled = false;
+  }
+  if (touch.bookmark && !touchHoldHandled) {
+    touchHoldHandled = true;
+    addBookmark();
+    showBookmarkMessage = true;
+    bookmarkMessageTime = millis();
+    requestUpdate();
+    return;
+  }
+  if (touch.dictionary && !touchHoldHandled) {
+    touchHoldHandled = true;
+    openDictionaryWordSelect();
+    return;
+  }
+
   if (!prevTriggered && !nextTriggered) {
     return;
   }
@@ -1972,23 +1993,76 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 #else
   const bool overlapRefresh = tiledGrayscale && renderer.supportsAsyncRefresh() && !pageHasImages;
 #endif
-  const auto drawGuideLines = [&] {
-    if (!SETTINGS.readingGuideLineEnabled) return;
-    const int x1 = orientedMarginLeft;
-    const int x2 = renderer.getScreenWidth() - orientedMarginRight - 1;
-    const int contentBottom = renderer.getScreenHeight() - orientedMarginBottom;
-    const int baseLineHeight = renderer.getLineHeight(fontId, SETTINGS.getReaderLineCompression());
-    const int ascender = renderer.getFontAscenderSize(fontId);
-    for (const auto& element : page->elements) {
-      if (element->getTag() != TAG_PageLine) continue;
-      const auto& line = static_cast<const PageLine&>(*element);
-      if (line.getBlock()->isEmpty()) continue;
-      const int lineHeight = baseLineHeight + line.getBlock()->getRubyShift(ascender);
-      const int guideY = orientedMarginTop + line.yPos + lineHeight + SETTINGS.readingGuideLineOffset;
-      if (readingGuideLine::fitsVertically(SETTINGS.readingGuideLineStyle, guideY, orientedMarginTop, contentBottom)) {
-        readingGuideLine::draw(renderer, x1, guideY, x2, SETTINGS.readingGuideLineStyle);
+
+  // Single-pass 2-bit AA fast path (non-tiled panels such as the X4 Pro).
+  // The classic non-tiled gray path renders the page three times (BW base,
+  // LSB plane, MSB plane) and re-walks the whole layout each pass. Here the
+  // page (text + guide lines) is rendered once into a 2-bits-per-pixel frame,
+  // then the BW base and the two gray planes are exported with the exact same
+  // per-pixel mapping table (see GfxRenderer::mapTwoBitPixel), so the planes
+  // reaching the controller are byte-identical to the three-pass result.
+  // Image pages, night mode and any allocation failure fall back to the
+  // classic path unchanged.
+  bool singlePassGray = !tiledGrayscale && needsTextGrayscale && !pageHasImages;
+  memory::ByteBuffer gray2BitBuf;
+  uint8_t* activeGray2Bit = nullptr;
+  bool usedPrerenderedFrame = false;
+  if (singlePassGray) {
+    // Prerender hit: the next page was laid out into a spare 2-bit frame
+    // during the previous page's idle period. Keyed by spine/page and a
+    // fingerprint of every layout-affecting setting, so any mismatch (style
+    // change, chapter edge, allocation failure) falls back to the normal path.
+    const bool prerenderHit = prerenderValid_ && !prerenderInProgress_ &&
+                              prerenderSpineIndex_ == currentSpineIndex &&
+                              prerenderPage_ == section->currentPage &&
+                              prerenderFingerprint_ == readerRenderSettingsFingerprint();
+    if (prerenderHit) {
+      activeGray2Bit = prerenderBuf_.get();
+      usedPrerenderedFrame = true;
+      prerenderValid_ = false;  // frame consumed
+    } else {
+      prerenderValid_ = false;
+      constexpr size_t GRAY2BIT_BUF_HEADROOM = 60000;
+      constexpr size_t GRAY2BIT_BUF_MAX_ALLOC_RESERVE = 16 * 1024;
+      const size_t gray2BitBytes =
+          GfxRenderer::gray2BitRowBytes(renderer.getDisplayWidth()) * renderer.getDisplayHeight();
+      const bool internalFits =
+          memory::hasAllocationHeadroom(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), gray2BitBytes, gray2BitBytes,
+                                        GRAY2BIT_BUF_HEADROOM, GRAY2BIT_BUF_MAX_ALLOC_RESERVE);
+      if (internalFits) {
+        gray2BitBuf = memory::makeInternalByteBufferNoThrow(gray2BitBytes);
+      }
+      if (!gray2BitBuf && memory::psramHasHeadroom(gray2BitBytes, gray2BitBytes, GRAY2BIT_BUF_MAX_ALLOC_RESERVE)) {
+        gray2BitBuf = memory::makePsramByteBufferNoThrow(gray2BitBytes);
+      }
+      if (!gray2BitBuf) {
+        singlePassGray = false;
+      } else {
+        activeGray2Bit = gray2BitBuf.get();
       }
     }
+  }
+  // Single-pass plane-export buffers (LSB/MSB, one framebuffer-sized 47KB
+  // each). Needed only for the single-pass export path; when allocation fails
+  // the grayscale flow falls back to the framebuffer-backed three-pass export
+  // (exportGrayFrameToLsb/Msb + copy). PSRAM preferred to keep internal heap
+  // headroom; both buffers are held for the whole activity lifetime.
+  memory::ByteBuffer planeExportBufLsb;
+  memory::ByteBuffer planeExportBufMsb;
+  bool singlePassPlaneExport = false;
+  if (singlePassGray) {
+    const size_t planeBytes = renderer.getBufferSize();
+    if (memory::psramHasHeadroom(planeBytes * 2, planeBytes * 2, 16 * 1024)) {
+      planeExportBufLsb = memory::makePsramByteBufferNoThrow(planeBytes);
+      if (planeExportBufLsb) {
+        planeExportBufMsb = memory::makePsramByteBufferNoThrow(planeBytes);
+      }
+    }
+    singlePassPlaneExport = planeExportBufLsb && planeExportBufMsb;
+  }
+  const auto drawGuideLines = [&] {
+    drawGuideLinesFor(page.get(), fontId, orientedMarginLeft, orientedMarginTop, orientedMarginRight,
+                      orientedMarginBottom);
   };
   const auto renderPageWithGuideLines = [&] {
     renderPage();
@@ -2010,7 +2084,22 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   };
 
   if (SETTINGS.readingBackgroundEnabled && !readingBackground::load(renderer)) renderer.clearScreen();
-  renderPageWithGuideLines();
+  if (singlePassGray) {
+    // Render the page once into the 2-bit frame, then export the BW base into
+    // the framebuffer (white pixels untouched so a background frame survives).
+    // A prerender hit reuses the frame already laid out in prerenderBuf_ and
+    // skips the layout walk.
+    renderer.begin2BitTarget(activeGray2Bit);
+    if (!usedPrerenderedFrame) {
+      renderer.clear2BitTarget(0x00);
+      renderPageWithGuideLines();
+    }
+    renderer.end2BitTarget();
+    renderer.setRenderMode(GfxRenderer::BW);
+    renderer.exportGrayFrameToBw();
+  } else {
+    renderPageWithGuideLines();
+  }
 #ifdef ENABLE_CHINESE_VERSION
   const uint32_t missingCodepoint = fcm->consumeMissingChineseCodepoint();
   if (missingCodepoint != 0 && !FontDownloadActivity::wasChineseFontPromptShownThisBoot()) {
@@ -2040,7 +2129,19 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh, overlapRefresh);
     }
 #else
-    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh, overlapRefresh);
+    if (needsTextGrayscale) {
+      // Non-tiled AA (X4 Pro / UC8179 / UC8279X4): the page is shown as a
+      // hard black-on-white B/W base first, then the gray planes land on top —
+      // read as a visible text-thickness flash (thick 1-bit glyphs -> thin
+      // anti-aliased glyphs). The driver's non-flashing prev->current settle
+      // transition (displayGrayscaleBase) fades the base in instead of
+      // slamming a full-screen refresh, without touching the final gray
+      // pixels. Periodic HALF purges still run a real B/W activation.
+      const auto mode = ReaderUtils::consumeRefreshMode(pagesUntilFullRefresh);
+      renderer.displayGrayscaleBase(mode);
+    } else {
+      ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh, overlapRefresh);
+    }
 #endif
   }
   const auto tDisplay = millis();
@@ -2182,10 +2283,80 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     }
   } else {
     if (needsAnyGrayscale) {
-      if (!renderer.storeBwBuffer()) {
+      if (singlePassGray && activeGray2Bit != nullptr) {
+        // Single-pass AA: the BW base (with status bar) is already displayed
+        // and the 2-bit frame holds the full grayscale content. Export the
+        // planes straight from the 2-bit frame — no second/third layout walk.
+        if (singlePassPlaneExport) {
+          // Single-pass export: one walk of the 2-bit frame writes BW into the
+          // framebuffer (background/status bar preserved), LSB/MSB into the two
+          // plane buffers. The framebuffer stays as the BW projection, so no
+          // store/restore of the BW buffer is needed either — two full-frame
+          // walks and two 47KB copies saved per AA page, pixels identical.
+          renderer.exportGrayFrameToPlanes(planeExportBufLsb.get(), planeExportBufMsb.get());
+
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+          renderer.copyGrayscaleLsbBuffersFrom(planeExportBufLsb.get());
+
+          if (activityManager.isSwitchPending()) {
+            renderer.setRenderMode(GfxRenderer::BW);
+            return;
+          }
+
+          renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+          renderer.copyGrayscaleMsbBuffersFrom(planeExportBufMsb.get());
+
+          if (activityManager.isSwitchPending()) {
+            renderer.setRenderMode(GfxRenderer::BW);
+            return;
+          }
+
+          renderer.setRenderMode(GfxRenderer::BW);
+          renderer.displayGrayBuffer();
+        } else if (!renderer.storeBwBuffer()) {
+          return;
+        } else {
+        const auto tBwStore = millis();
+
+        renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+        renderer.exportGrayFrameToLsb();
+        renderer.copyGrayscaleLsbBuffers();
+        const auto tGrayLsb = millis();
+
+        if (activityManager.isSwitchPending()) {
+          renderer.setRenderMode(GfxRenderer::BW);
+          renderer.restoreBwBuffer();
+          return;
+        }
+
+        renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+        renderer.exportGrayFrameToMsb();
+        renderer.copyGrayscaleMsbBuffers();
+        const auto tGrayMsb = millis();
+
+        if (activityManager.isSwitchPending()) {
+          renderer.setRenderMode(GfxRenderer::BW);
+          renderer.restoreBwBuffer();
+          return;
+        }
+
+        renderer.setRenderMode(GfxRenderer::BW);
+        renderer.displayGrayBuffer();
+        const auto tGrayDisplay = millis();
+        renderer.restoreBwBuffer();
+        const auto tBwRestore = millis();
+
+        const auto tEnd = millis();
+        LOG_DBG("ERS",
+                "Page render: prewarm=%lums bw_render=%lums display=%lums bw_store=%lums "
+                "gray_lsb=%lums gray_msb=%lums gray_display=%lums bw_restore=%lums total=%lums",
+                tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
+                tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
+        }
+      } else if (!renderer.storeBwBuffer()) {
         LOG_ERR("ERS", "Failed to store BW buffer for grayscale render; skipping grayscale this page");
         return;
-      }
+      } else {
       const auto tBwStore = millis();
 
       renderer.clearScreen(0x00);
@@ -2225,12 +2396,110 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
               "gray_lsb=%lums gray_msb=%lums gray_display=%lums bw_restore=%lums total=%lums",
               tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
               tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
+      }
     } else {
       const auto tEnd = millis();
       LOG_DBG("ERS", "Page render: prewarm=%lums bw_render=%lums display=%lums total=%lums", tPrewarm - t0,
               tBwRender - tPrewarm, tDisplay - tBwRender, tEnd - t0);
     }
+    // After a single-pass gray commit the panel waveform has already run and
+    // the CPU is idle again; use this window to lay out the next page of the
+    // same section into the spare 2-bit frame. A later flip with a matching
+    // spine/page/fingerprint skips the layout walk entirely; any mismatch
+    // (style change, chapter edge, allocation failure, pending switch) simply
+    // falls back to the normal render path.
+    if (singlePassGray) {
+      prerenderNextPage(fontId, orientedMarginLeft, orientedMarginTop, orientedMarginRight, orientedMarginBottom);
+    }
   }
+}
+
+uint32_t EpubReaderActivity::readerRenderSettingsFingerprint() const {
+  uint32_t fp = 2166136261u;  // FNV-1a offset basis
+  const auto mix = [&fp](uint32_t v) { fp = (fp ^ v) * 16777619u; };
+  const auto& st = SETTINGS;
+  mix(st.fontFamily);
+  mix(st.fontPointSize);
+  mix(st.lineSpacing);
+  mix(st.paragraphAlignment);
+  mix(st.extraParagraphSpacing);
+  mix(st.firstLineIndent);
+  mix(st.textAntiAliasing);
+  mix(st.fakeBold);
+  mix(st.readingBackgroundEnabled);
+  mix(st.readingGuideLineEnabled);
+  mix(st.readingGuideLineStyle);
+  mix(static_cast<uint32_t>(static_cast<int8_t>(st.readingGuideLineOffset)));
+  mix(st.orientation);
+  mix(st.screenMargin);
+  mix(st.hyphenationEnabled);
+  mix(renderer.isInverted() ? 1u : 0u);
+  const float lc = st.getReaderLineCompression();
+  uint32_t lcBits = 0;
+  static_assert(sizeof(lcBits) == sizeof(lc), "fingerprint hash width");
+  memcpy(&lcBits, &lc, sizeof(lcBits));
+  mix(lcBits);
+  return fp;
+}
+
+void EpubReaderActivity::drawGuideLinesFor(Page* page, int fontId, int ml, int mt, int mr, int mb) const {
+  if (page == nullptr || !SETTINGS.readingGuideLineEnabled) return;
+  const int x1 = ml;
+  const int x2 = renderer.getScreenWidth() - mr - 1;
+  const int contentBottom = renderer.getScreenHeight() - mb;
+  const int baseLineHeight = renderer.getLineHeight(fontId, SETTINGS.getReaderLineCompression());
+  const int ascender = renderer.getFontAscenderSize(fontId);
+  for (const auto& element : page->elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto& line = static_cast<const PageLine&>(*element);
+    if (line.getBlock()->isEmpty()) continue;
+    const int lineHeight = baseLineHeight + line.getBlock()->getRubyShift(ascender);
+    const int guideY = mt + line.yPos + lineHeight + SETTINGS.readingGuideLineOffset;
+    if (readingGuideLine::fitsVertically(SETTINGS.readingGuideLineStyle, guideY, mt, contentBottom)) {
+      readingGuideLine::draw(renderer, x1, guideY, x2, SETTINGS.readingGuideLineStyle);
+    }
+  }
+}
+
+void EpubReaderActivity::renderBodyToTwoBitFrame(Page* page, uint8_t* buf, int fontId, int ml, int mt, int mr,
+                                                 int mb) const {
+  if (page == nullptr || buf == nullptr) return;
+  renderer.begin2BitTarget(buf);
+  renderer.clear2BitTarget(0x00);
+  page->render(renderer, fontId, ml, mt);
+  drawGuideLinesFor(page, fontId, ml, mt, mr, mb);
+  renderer.end2BitTarget();
+}
+
+void EpubReaderActivity::prerenderNextPage(int fontId, int ml, int mt, int mr, int mb) {
+  if (prerenderInProgress_ || section == nullptr) return;
+  // A switch/pop is pending: don't spend time on a frame that will be thrown
+  // away; the normal render path covers the next flip.
+  if (activityManager.isSwitchPending()) return;
+  // Only prerender within the same section (chapter edge -> next spine is a
+  // bigger state change; skip it and fall back to the normal path).
+  const int nextPage = section->currentPage + 1;
+  if (nextPage >= section->pageCount) return;
+  const size_t bytes = GfxRenderer::gray2BitRowBytes(renderer.getDisplayWidth()) * renderer.getDisplayHeight();
+  if (!prerenderBuf_ || prerenderBufBytes_ < bytes) {
+    prerenderBuf_.reset();
+    prerenderBufBytes_ = 0;
+    constexpr size_t PRERENDER_RESERVE = 16 * 1024;
+    if (memory::psramHasHeadroom(bytes, bytes, PRERENDER_RESERVE)) {
+      prerenderBuf_ = memory::makePsramByteBufferNoThrow(bytes);
+    }
+    if (!prerenderBuf_) return;
+    prerenderBufBytes_ = bytes;
+  }
+  auto next = section->loadPage(nextPage);
+  if (!next) return;
+  prerenderInProgress_ = true;
+  renderBodyToTwoBitFrame(next.get(), prerenderBuf_.get(), fontId, ml, mt, mr, mb);
+  prerenderInProgress_ = false;
+  prerenderSpineIndex_ = currentSpineIndex;
+  prerenderPage_ = nextPage;
+  prerenderFingerprint_ = readerRenderSettingsFingerprint();
+  prerenderValid_ = true;
 }
 
 void EpubReaderActivity::renderStatusBar() const {

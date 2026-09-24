@@ -10,6 +10,7 @@
 #include <Utf8.h>
 
 #include <algorithm>
+#include <array>
 #include <string_view>
 
 #include "FontCacheManager.h"
@@ -379,6 +380,13 @@ static uint8_t get2BitCoverage(const uint8_t* bitmap, const int pixelPosition) {
 
 static void draw2BitGlyphPixel(const GfxRenderer& renderer, const GfxRenderer::RenderMode renderMode, const int x,
                                const int y, const bool pixelState, const uint8_t coverage) {
+  if (renderer.is2BitTargetActive()) {
+    // Single-pass AA frame: store the raw 2-bit coverage (0=white..3=black)
+    // directly. The BW/LSB/MSB planes are exported later with the same mapping
+    // table the per-mode render used, so the exported pixels are identical.
+    renderer.draw2BitPixel(x, y, coverage);
+    return;
+  }
   const auto pixel = GfxRenderer::mapTwoBitGlyphCoverage(renderMode, coverage);
   if (!pixel.draw) return;
   renderer.drawPixel(x, y, renderMode == GfxRenderer::BW ? pixelState : pixel.state);
@@ -422,6 +430,7 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
         const int srcX = dstX * 2;
         uint8_t coverage = 0;
         uint8_t maxRaw = 0;
+        uint8_t samples = 0;
         for (int sampleY = 0; sampleY < 2 && srcY + sampleY < srcH; sampleY++) {
           for (int sampleX = 0; sampleX < 2 && srcX + sampleX < srcW; sampleX++) {
             const int pos = (srcY + sampleY) * srcW + srcX + sampleX;
@@ -429,10 +438,20 @@ static void renderCharScaled(const GfxRenderer& renderer, GfxRenderer::RenderMod
             const uint8_t raw = (byte >> ((3 - (pos & 3)) * 2)) & 0x3;
             coverage += raw;
             if (raw > maxRaw) maxRaw = raw;
+            samples++;
           }
         }
         if (maxRaw >= 2 || coverage >= 2) {
-          drawGlyphPixel(renderer, baseX + dstX, baseY + dstY, pixelState, syntheticBoldPixels);
+          if (renderer.is2BitTargetActive()) {
+            // True AA downscale: average the 2x2 coverage into the 2-bit gray
+            // frame (rounded), so SUP/SUB glyphs get smooth edges instead of
+            // hard "block has ink" sampling.
+            const uint8_t avgCoverage =
+                static_cast<uint8_t>((coverage + samples / 2) / samples);
+            renderer.draw2BitPixel(baseX + dstX, baseY + dstY, avgCoverage);
+          } else {
+            drawGlyphPixel(renderer, baseX + dstX, baseY + dstY, pixelState, syntheticBoldPixels);
+          }
         }
       }
     }
@@ -592,6 +611,14 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
     return;
   }
 
+  // Single-pass 2-bit grayscale frame: store black/white and let the glyph
+  // path store its exact coverage. draw2BitPixel re-does the clip/rotate, so
+  // keep this branch before the 1-bit path (the reader never mixes targets).
+  if (_gray2BitActive) {
+    draw2BitPixel(x, y, state ? 3 : 0);
+    return;
+  }
+
   int phyX = 0;
   int phyY = 0;
 
@@ -625,6 +652,223 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
     target[byteIndex] &= ~(1 << bitPosition);  // Clear bit
   } else {
     target[byteIndex] |= 1 << bitPosition;  // Set bit
+  }
+}
+
+void GfxRenderer::draw2BitPixel(const int x, const int y, const uint8_t value) const {
+  if (clipActive && (x < clipX0 || x >= clipX1 || y < clipY0 || y >= clipY1)) {
+    return;
+  }
+  if (!_gray2BitActive || _gray2BitBuf == nullptr) return;
+
+  int phyX = 0;
+  int phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
+    return;
+  }
+  if (_stripActive && (phyY < _stripY0 || phyY >= _stripY0 + _stripRows)) {
+    return;  // pixel outside the band currently being rendered
+  }
+
+  // 2-bit packing, MSB first, 2 bits per pixel (same as EpdFont 2-bit glyphs).
+  const uint32_t byteIndex = static_cast<uint32_t>(phyY) * gray2BitRowBytes(panelWidth) +
+                             static_cast<uint32_t>(phyX) / 4u;
+  const uint8_t shift = static_cast<uint8_t>(3 - (phyX & 3)) * 2u;
+  _gray2BitBuf[byteIndex] =
+      static_cast<uint8_t>((_gray2BitBuf[byteIndex] & static_cast<uint8_t>(~(0x3 << shift))) |
+                           ((value & 0x3) << shift));
+}
+
+void GfxRenderer::clear2BitTarget(const uint8_t value) const {
+  if (_gray2BitBuf == nullptr) return;
+  memset(_gray2BitBuf, value, gray2BitRowBytes(panelWidth) * panelHeight);
+}
+
+// 256-entry export masks: a 2-bit frame byte packs 4 pixels (MSB first,
+// 2 bits per pixel); each table yields the 4-bit plane mask for those pixels
+// (bit7=px0 .. bit4=px3), using the same mapping as grayFrameExportBit.
+struct ExportMasks {
+  uint8_t bw;   // BW: ink pixels (bit cleared in the framebuffer)
+  uint8_t lsb;  // LSB: dark-gray pixels (bit set)
+  uint8_t msb;  // MSB: light- or dark-gray pixels (bit set)
+};
+constexpr std::array<ExportMasks, 256> kExportMasks = [] {
+  std::array<ExportMasks, 256> t{};
+  for (int b = 0; b < 256; b++) {
+    uint8_t bw = 0, lsb = 0, msb = 0;
+    for (int px = 0; px < 4; px++) {
+      const uint8_t c = static_cast<uint8_t>((b >> ((3 - px) * 2)) & 0x3);
+      if (GfxRenderer::grayFrameExportBit(GfxRenderer::BW, c)) bw |= static_cast<uint8_t>(0x80 >> px);
+      if (GfxRenderer::grayFrameExportBit(GfxRenderer::GRAYSCALE_LSB, c)) lsb |= static_cast<uint8_t>(0x80 >> px);
+      if (GfxRenderer::grayFrameExportBit(GfxRenderer::GRAYSCALE_MSB, c)) msb |= static_cast<uint8_t>(0x80 >> px);
+    }
+    t[b] = {bw, lsb, msb};
+  }
+  return t;
+}();
+
+// Combines the two 4-pixel groups of one framebuffer byte: bits 7..4 from the
+// even 2-bit byte, bits 3..0 from the odd one (its mask shifted down by 4).
+inline uint8_t combineExport(const uint8_t hi, const uint8_t lo) {
+  return static_cast<uint8_t>((hi & 0xF0) | (lo >> 4));
+}
+
+// --- AA frame post-processing ------------------------------------------------
+// Pixel-level rules applied to the 2-bit gray frame right before the single-walk
+// plane export (see RENDER_OPTIMIZATION_NOTES.md, "AA frame post-processing"):
+//   1. Isolated AA speckle removal: light/dark gray with an all-white
+//      4-neighbourhood is cleared to white.
+//   2. Stroke hole fill: dark gray with >= 3 black neighbours becomes black;
+//      light gray fully enclosed by black becomes black (tiny-hole pass).
+//   3. Thin-stroke compensation: light gray with >= 2 dark neighbours becomes
+//      dark gray (stroke edge); light gray with exactly 1 dark neighbour whose
+//      stroke continues through this pixel becomes dark gray (stroke endpoint
+//      fill, keeps thin stroke tips solid).
+// kGrayGamma[4] is the display gamma hook: map the logical gray level to the
+// level that actually reads best on the panel. Linear {0,1,2,3} = no-op.
+// Panel candidates to try on device: {0,0,1,3} (light gray -> white, crisper
+// edges closer to the stock look) or {0,1,1,3} (keep light gray, deepen mid).
+namespace {
+constexpr std::array<uint8_t, 4> kGrayGamma = {0, 1, 2, 3};
+
+inline uint8_t grayPx(const uint8_t* frame, const uint32_t rowBytes2, const uint32_t x,
+                      const uint32_t y, const uint32_t w, const uint32_t h) {
+  if (x >= w || y >= h) return 0;
+  const uint8_t byte = frame[y * rowBytes2 + (x >> 2)];
+  return static_cast<uint8_t>((byte >> ((3 - (x & 3)) * 2)) & 0x3);
+}
+
+inline void setGrayPx(uint8_t* frame, const uint32_t rowBytes2, const uint32_t x,
+                      const uint32_t y, const uint8_t v) {
+  uint8_t& byte = frame[y * rowBytes2 + (x >> 2)];
+  const uint8_t shift = static_cast<uint8_t>((3 - (x & 3)) * 2);
+  byte = static_cast<uint8_t>((byte & ~(0x3u << shift)) | (static_cast<uint8_t>(v & 0x3) << shift));
+}
+}  // namespace
+
+static void apply2BitGammaAndSmooth(uint8_t* gray, const uint32_t rowBytes2, const uint32_t w,
+                                    const uint32_t h) {
+  if (gray == nullptr) return;
+  // Neighbourhood reads must see the untouched frame, so smooth into a copy
+  // and write the result back in place.
+  const uint32_t frameBytes = rowBytes2 * h;
+  uint8_t* copy = static_cast<uint8_t*>(malloc(frameBytes));
+  if (copy == nullptr) return;
+  memcpy(copy, gray, frameBytes);
+  for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint8_t c = grayPx(copy, rowBytes2, x, y, w, h);
+      const uint8_t l = grayPx(copy, rowBytes2, x - 1, y, w, h);
+      const uint8_t r = grayPx(copy, rowBytes2, x + 1, y, w, h);
+      const uint8_t u = grayPx(copy, rowBytes2, x, y - 1, w, h);
+      const uint8_t d = grayPx(copy, rowBytes2, x, y + 1, w, h);
+      uint8_t out = kGrayGamma[c];
+      if ((c == 1 || c == 2) && (l | r | u | d) == 0) {
+        out = 0;  // isolated AA speckle: neighbours all white -> white
+      } else if (c == 2) {
+        const uint8_t blacks = static_cast<uint8_t>((l == 3) + (r == 3) + (u == 3) + (d == 3));
+        if (blacks >= 3) out = 3;  // stroke hole fill
+      } else if (c == 1) {
+        if (l == 3 && r == 3 && u == 3 && d == 3) {
+          out = 3;  // tiny hole fully enclosed by black
+        } else {
+          const uint8_t darks = static_cast<uint8_t>((l >= 2) + (r >= 2) + (u >= 2) + (d >= 2));
+          if (darks >= 2) {
+            out = 2;  // stroke edge: two or more dark neighbours
+          } else if (darks == 1) {
+            // Stroke endpoint: exactly one dark neighbour. Fill the tip only
+            // when the stroke continues through this pixel (the pixel on the
+            // opposite side is not white), so isolated edge pixels are not
+            // fattened into speckle.
+            const bool continues =
+                ((l >= 2) && r != 0) || ((r >= 2) && l != 0) ||
+                ((u >= 2) && d != 0) || ((d >= 2) && u != 0);
+            if (continues) out = 2;
+          }
+        }
+      }
+      setGrayPx(gray, rowBytes2, x, y, out);
+    }
+  }
+  free(copy);
+}
+
+void GfxRenderer::exportGrayFrameToBw() const {
+  // Base frame: white (value==0) is left untouched so a background frame
+  // already loaded into the framebuffer survives; every non-white pixel
+  // becomes ink (cleared bit), matching drawPixel(state=true) on the 1-bit
+  // path.
+  if (_gray2BitBuf == nullptr || frameBuffer == nullptr) return;
+  const uint32_t rowBytes2 = gray2BitRowBytes(panelWidth);
+  for (uint32_t row = 0; row < panelHeight; row++) {
+    const uint8_t* src = _gray2BitBuf + row * rowBytes2;
+    uint8_t* dst = frameBuffer + row * panelWidthBytes;
+    for (uint32_t i = 0; i < rowBytes2; i += 2) {
+      const uint8_t b0 = src[i];
+      const uint8_t b1 = src[i + 1];
+      if ((b0 | b1) == 0) continue;  // all-white group: keep the background frame
+      dst[i >> 1] &= static_cast<uint8_t>(~combineExport(kExportMasks[b0].bw, kExportMasks[b1].bw));
+    }
+  }
+}
+
+void GfxRenderer::exportGrayFrameToPlanes(uint8_t* lsbBuf, uint8_t* msbBuf) const {
+  // Single walk of the 2-bit frame producing all three planes: BW into the
+  // framebuffer (white groups untouched, so a background/status bar frame
+  // survives — identical to exportGrayFrameToBw), LSB/MSB into the caller's
+  // buffers (zeroed first, identical to exportGrayFrameToLsb/Msb). Saves two
+  // full-frame walks per AA page; pixels are byte-for-byte the same.
+  if (_gray2BitBuf == nullptr || frameBuffer == nullptr || lsbBuf == nullptr || msbBuf == nullptr) return;
+  const uint32_t rowBytes2 = gray2BitRowBytes(panelWidth);
+  apply2BitGammaAndSmooth(_gray2BitBuf, rowBytes2, panelWidth, panelHeight);  // AA post-processing
+  memset(lsbBuf, 0x00, frameBufferSize);
+  memset(msbBuf, 0x00, frameBufferSize);
+  for (uint32_t row = 0; row < panelHeight; row++) {
+    const uint8_t* src = _gray2BitBuf + row * rowBytes2;
+    uint8_t* dstBw = frameBuffer + row * panelWidthBytes;
+    uint8_t* dstLsb = lsbBuf + row * panelWidthBytes;
+    uint8_t* dstMsb = msbBuf + row * panelWidthBytes;
+    for (uint32_t i = 0; i < rowBytes2; i += 2) {
+      const uint8_t b0 = src[i];
+      const uint8_t b1 = src[i + 1];
+      const auto& m0 = kExportMasks[b0];
+      const auto& m1 = kExportMasks[b1];
+      if ((b0 | b1) != 0) {
+        dstBw[i >> 1] &= static_cast<uint8_t>(~combineExport(m0.bw, m1.bw));
+      }
+      dstLsb[i >> 1] = combineExport(m0.lsb, m1.lsb);
+      dstMsb[i >> 1] = combineExport(m0.msb, m1.msb);
+    }
+  }
+}
+
+void GfxRenderer::exportGrayFrameToLsb() const {
+  // LSB plane: dark-gray pixels (value==2) set the bit; everything else is
+  // cleared first, matching the old clearScreen(0x00) + draw pass.
+  if (_gray2BitBuf == nullptr || frameBuffer == nullptr) return;
+  memset(frameBuffer, 0x00, frameBufferSize);
+  const uint32_t rowBytes2 = gray2BitRowBytes(panelWidth);
+  for (uint32_t row = 0; row < panelHeight; row++) {
+    const uint8_t* src = _gray2BitBuf + row * rowBytes2;
+    uint8_t* dst = frameBuffer + row * panelWidthBytes;
+    for (uint32_t i = 0; i < rowBytes2; i += 2) {
+      dst[i >> 1] = combineExport(kExportMasks[src[i]].lsb, kExportMasks[src[i + 1]].lsb);
+    }
+  }
+}
+
+void GfxRenderer::exportGrayFrameToMsb() const {
+  // MSB plane: light- or dark-gray pixels (value 1 or 2) set the bit.
+  if (_gray2BitBuf == nullptr || frameBuffer == nullptr) return;
+  memset(frameBuffer, 0x00, frameBufferSize);
+  const uint32_t rowBytes2 = gray2BitRowBytes(panelWidth);
+  for (uint32_t row = 0; row < panelHeight; row++) {
+    const uint8_t* src = _gray2BitBuf + row * rowBytes2;
+    uint8_t* dst = frameBuffer + row * panelWidthBytes;
+    for (uint32_t i = 0; i < rowBytes2; i += 2) {
+      dst[i >> 1] = combineExport(kExportMasks[src[i]].msb, kExportMasks[src[i + 1]].msb);
+    }
   }
 }
 
@@ -2388,6 +2632,10 @@ void GfxRenderer::preconditionGrayscale(int x, int y, int w, int h) const {
 void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuffers(frameBuffer); }
 
 void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
+
+void GfxRenderer::copyGrayscaleLsbBuffersFrom(const uint8_t* lsbBuf) const { display.copyGrayscaleLsbBuffers(lsbBuf); }
+
+void GfxRenderer::copyGrayscaleMsbBuffersFrom(const uint8_t* msbBuf) const { display.copyGrayscaleMsbBuffers(msbBuf); }
 
 void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
 

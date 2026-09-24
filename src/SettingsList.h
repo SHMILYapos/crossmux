@@ -46,7 +46,8 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
     std::transform(families.begin(), families.end(), std::back_inserter(s.enumStringValues),
                    [](const SdCardFontFamilyInfo& f) { return f.name; });
   } else {
-    s.enumValues = std::move(enumValues);
+    s.enumStringValues.reserve(builtinOptionCount);
+    for (const StrId value : enumValues) s.enumStringValues.push_back(I18N.get(value));
   }
 
   // The global SdCardFontSystem owns the registry for the lifetime of every
@@ -309,8 +310,9 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
             {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_ORIENTATION_INVERTED, StrId::STR_LANDSCAPE_CCW},
             "orientation", StrId::STR_CAT_READER),
         SettingInfo::Enum(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing,
-                          {StrId::STR_EXTRA_SPACING_OFF, StrId::STR_EXTRA_SPACING_0_5, StrId::STR_EXTRA_SPACING_0_75,
-                           StrId::STR_EXTRA_SPACING_1, StrId::STR_EXTRA_SPACING_1_25, StrId::STR_EXTRA_SPACING_1_5},
+                          {StrId::STR_EXTRA_SPACING_OFF, StrId::STR_EXTRA_SPACING_0_25, StrId::STR_EXTRA_SPACING_0_5,
+                           StrId::STR_EXTRA_SPACING_0_75, StrId::STR_EXTRA_SPACING_1, StrId::STR_EXTRA_SPACING_1_25,
+                           StrId::STR_EXTRA_SPACING_1_5},
                           "extraParagraphSpacing", StrId::STR_CAT_READER)
             .withTextSettings(),
         SettingInfo::Enum(StrId::STR_FIRST_LINE_INDENT, &CrossPointSettings::firstLineIndent,
@@ -319,6 +321,9 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
                           "firstLineIndent", StrId::STR_CAT_READER)
             .withTextSettings(),
         SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
+                            StrId::STR_CAT_READER)
+            .withTextSettings(),
+        SettingInfo::Toggle(StrId::STR_BOOK_STYLE_MEMORY, &CrossPointSettings::bookStyleMemory, "bookStyleMemory",
                             StrId::STR_CAT_READER)
             .withTextSettings(),
         SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
@@ -333,10 +338,17 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
         SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
                           {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_DISABLED}, "sideButtonLayout",
                           StrId::STR_CAT_CONTROLS),
-        SettingInfo::Enum(
-            StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
-            {StrId::STR_STATE_OFF, StrId::STR_STATE_TAP, StrId::STR_STATE_SWIPE, StrId::STR_STATE_INVERTED_TAP},
-            "touchReaderControls", StrId::STR_CAT_CONTROLS),
+        // Touch reader controls: master switch only. The per-direction page
+        // turn gestures below pick how each direction is triggered.
+        SettingInfo::Toggle(StrId::STR_TOUCH_READER_CONTROLS, &CrossPointSettings::touchReaderControls,
+                            "touchReaderControls", StrId::STR_CAT_CONTROLS),
+        SettingInfo::Enum(StrId::STR_PAGE_TURN_GESTURE, &CrossPointSettings::pageTurnGesture,
+                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY, StrId::STR_DISABLED},
+                          "pageTurnGesture", StrId::STR_CAT_CONTROLS),
+        SettingInfo::Enum(StrId::STR_PREV_PAGE_GESTURE, &CrossPointSettings::previousPageGesture,
+                          {StrId::STR_TAP_AND_SWIPE, StrId::STR_TAP_ONLY, StrId::STR_SWIPE_ONLY, StrId::STR_DISABLED},
+                          "previousPageGesture", StrId::STR_CAT_CONTROLS),
+        SettingInfo::Action(StrId::STR_TAP_ZONES, SettingAction::TapZones, StrId::STR_CAT_CONTROLS),
         // Persisted under the legacy "tapForReaderMenu" key: old saves map
         // 0 = Off, 1 = Tap.
         SettingInfo::Enum(StrId::STR_SHOW_READER_MENU, &CrossPointSettings::showReaderMenu,
@@ -516,7 +528,14 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
 }
 
 inline bool isSettingAvailableOnBoard(const SettingInfo& setting) {
-  if (!BoardConfig::hasTouch() && setting.nameId == StrId::STR_TOUCH_READER_CONTROLS) return false;
+  if (!BoardConfig::hasTouch()) {
+    // Touch-only controls: the master switch, the per-direction gestures and
+    // the tap-zone editor all need a touch controller.
+    if (setting.nameId == StrId::STR_TOUCH_READER_CONTROLS || setting.nameId == StrId::STR_PAGE_TURN_GESTURE ||
+        setting.nameId == StrId::STR_PREV_PAGE_GESTURE || setting.nameId == StrId::STR_TAP_ZONES) {
+      return false;
+    }
+  }
   if (!BoardConfig::hasHomeKey() && setting.nameId == StrId::STR_SHOW_READER_MENU) return false;
   const bool frontlightSetting = setting.valuePtr == &CrossPointSettings::frontlightBrightness ||
                                  setting.valuePtr == &CrossPointSettings::frontlightOn ||
