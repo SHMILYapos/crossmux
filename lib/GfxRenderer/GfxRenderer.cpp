@@ -725,7 +725,7 @@ inline uint8_t combineExport(const uint8_t hi, const uint8_t lo) {
 
 // --- AA frame post-processing ------------------------------------------------
 // Pixel-level rules applied to the 2-bit gray frame right before the single-walk
-// plane export (see RENDER_OPTIMIZATION_NOTES.md, "AA frame post-processing"):
+// plane export:
 //   1. Isolated AA speckle removal: light/dark gray with an all-white
 //      4-neighbourhood is cleared to white.
 //   2. Stroke hole fill: dark gray with >= 3 black neighbours becomes black;
