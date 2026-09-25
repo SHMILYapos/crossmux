@@ -310,7 +310,7 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
             {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_ORIENTATION_INVERTED, StrId::STR_LANDSCAPE_CCW},
             "orientation", StrId::STR_CAT_READER),
         SettingInfo::Enum(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing,
-                          {StrId::STR_EXTRA_SPACING_OFF, StrId::STR_EXTRA_SPACING_0_25, StrId::STR_EXTRA_SPACING_0_5,
+                          {StrId::STR_EXTRA_SPACING_OFF, StrId::STR_EXTRA_SPACING_0_5,
                            StrId::STR_EXTRA_SPACING_0_75, StrId::STR_EXTRA_SPACING_1, StrId::STR_EXTRA_SPACING_1_25,
                            StrId::STR_EXTRA_SPACING_1_5},
                           "extraParagraphSpacing", StrId::STR_CAT_READER)

@@ -164,8 +164,7 @@ Without a CSS indent, Auto leaves paragraphs unindented. Select Indent to retain
 the implicit indentation used by older firmware when extra paragraph spacing was off.
 
 Versions 70/71 encode `extraParagraphSpacing` as a byte: 0 disables extra spacing;
-1..5 add 0.5, 0.75, 1, 1.25 or 1.5 line heights after a paragraph. Version 72/71
-adds a 0.25x level, so the byte now encodes 1..6 as 0.25, 0.5, 0.75, 1, 1.25 or 1.5.
+1..5 add 0.5, 0.75, 1, 1.25 or 1.5 line heights after a paragraph.
 The exact level and `firstLineIndent` are independent cache keys. Both complete
 and partial caches from earlier versions are rebuilt; older firmware rejects the
 new version rather than reading spacing levels 2..5 as a boolean. TXT keeps its
