@@ -54,6 +54,7 @@
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
+#include "util/UserGuide.h"
 
 #if CROSSPOINT_CAP_SOUND_FEEDBACK
 #include <SoundFeedback.h>
@@ -602,7 +603,8 @@ void setup() {
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
 
-  RECENT_BOOKS.loadFromFile();
+  const bool recentsLoaded = RECENT_BOOKS.loadFromFile();
+  if (!recoveryFirmwareMode && !HalSystem::isRebootFromPanic()) UserGuide::prepare(recentsLoaded);
   READING_STATS.loadFromFile();
   BOOK_STYLES.loadFromFile();
   ACHIEVEMENTS.loadFromFile();
