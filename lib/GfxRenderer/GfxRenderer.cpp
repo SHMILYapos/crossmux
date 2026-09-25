@@ -756,51 +756,99 @@ inline void setGrayPx(uint8_t* frame, const uint32_t rowBytes2, const uint32_t x
 }
 }  // namespace
 
+// Reusable scratch for the AA post-processing pass: PSRAM-first, allocated once
+// and reused across frames so a 94KB internal-heap alloc/free + fragmentation
+// churn is not repeated on every AA page. Falls back to the internal heap.
+static memory::ByteBuffer s_aaSmoothScratch;
+static uint32_t s_aaSmoothScratchSize = 0;
+
 static void apply2BitGammaAndSmooth(uint8_t* gray, const uint32_t rowBytes2, const uint32_t w,
                                     const uint32_t h) {
   if (gray == nullptr) return;
   // Neighbourhood reads must see the untouched frame, so smooth into a copy
   // and write the result back in place.
   const uint32_t frameBytes = rowBytes2 * h;
-  uint8_t* copy = static_cast<uint8_t*>(malloc(frameBytes));
-  if (copy == nullptr) return;
+  if (frameBytes > s_aaSmoothScratchSize) {
+    s_aaSmoothScratch = memory::makePsramByteBufferUninitializedNoThrow(frameBytes);
+    if (!s_aaSmoothScratch) {
+      s_aaSmoothScratch = memory::makeInternalByteBufferNoThrow(frameBytes);
+    }
+    s_aaSmoothScratchSize = s_aaSmoothScratch ? frameBytes : 0;
+  }
+  if (!s_aaSmoothScratch) return;
+  uint8_t* copy = s_aaSmoothScratch.get();
   memcpy(copy, gray, frameBytes);
-  for (uint32_t y = 0; y < h; ++y) {
-    for (uint32_t x = 0; x < w; ++x) {
-      const uint8_t c = grayPx(copy, rowBytes2, x, y, w, h);
-      const uint8_t l = grayPx(copy, rowBytes2, x - 1, y, w, h);
-      const uint8_t r = grayPx(copy, rowBytes2, x + 1, y, w, h);
-      const uint8_t u = grayPx(copy, rowBytes2, x, y - 1, w, h);
-      const uint8_t d = grayPx(copy, rowBytes2, x, y + 1, w, h);
-      uint8_t out = kGrayGamma[c];
-      if ((c == 1 || c == 2) && (l | r | u | d) == 0) {
-        out = 0;  // isolated AA speckle: neighbours all white -> white
-      } else if (c == 2) {
-        const uint8_t blacks = static_cast<uint8_t>((l == 3) + (r == 3) + (u == 3) + (d == 3));
-        if (blacks >= 3) out = 3;  // stroke hole fill
-      } else if (c == 1) {
-        if (l == 3 && r == 3 && u == 3 && d == 3) {
-          out = 3;  // tiny hole fully enclosed by black
-        } else {
-          const uint8_t darks = static_cast<uint8_t>((l >= 2) + (r >= 2) + (u >= 2) + (d >= 2));
-          if (darks >= 2) {
-            out = 2;  // stroke edge: two or more dark neighbours
-          } else if (darks == 1) {
-            // Stroke endpoint: exactly one dark neighbour. Fill the tip only
-            // when the stroke continues through this pixel (the pixel on the
-            // opposite side is not white), so isolated edge pixels are not
-            // fattened into speckle.
-            const bool continues =
-                ((l >= 2) && r != 0) || ((r >= 2) && l != 0) ||
-                ((u >= 2) && d != 0) || ((d >= 2) && u != 0);
-            if (continues) out = 2;
-          }
+
+  // Pixel rule — unchanged semantics from the original loop, hoisted so the
+  // border and interior passes share one inlined implementation.
+  auto smoothPixel = [](const uint8_t c, const uint8_t l, const uint8_t r, const uint8_t u,
+                        const uint8_t d) -> uint8_t {
+    uint8_t out = kGrayGamma[c];
+    if ((c == 1 || c == 2) && (l | r | u | d) == 0) {
+      out = 0;  // isolated AA speckle: neighbours all white -> white
+    } else if (c == 2) {
+      const uint8_t blacks = static_cast<uint8_t>((l == 3) + (r == 3) + (u == 3) + (d == 3));
+      if (blacks >= 3) out = 3;  // stroke hole fill
+    } else if (c == 1) {
+      if (l == 3 && r == 3 && u == 3 && d == 3) {
+        out = 3;  // tiny hole fully enclosed by black
+      } else {
+        const uint8_t darks = static_cast<uint8_t>((l >= 2) + (r >= 2) + (u >= 2) + (d >= 2));
+        if (darks >= 2) {
+          out = 2;  // stroke edge: two or more dark neighbours
+        } else if (darks == 1) {
+          // Stroke endpoint: exactly one dark neighbour. Fill the tip only
+          // when the stroke continues through this pixel (the pixel on the
+          // opposite side is not white), so isolated edge pixels are not
+          // fattened into speckle.
+          const bool continues =
+              ((l >= 2) && r != 0) || ((r >= 2) && l != 0) ||
+              ((u >= 2) && d != 0) || ((d >= 2) && u != 0);
+          if (continues) out = 2;
         }
       }
-      setGrayPx(gray, rowBytes2, x, y, out);
+    }
+    return out;
+  };
+
+  // Border rows/columns: keep the bounds-checked accessor for the frame edge.
+  auto processBorder = [&](const uint32_t x, const uint32_t y) {
+    const uint8_t c = grayPx(copy, rowBytes2, x, y, w, h);
+    if (c == 0 && kGrayGamma[0] == 0) return;  // white pixel: unchanged
+    const uint8_t l = grayPx(copy, rowBytes2, x - 1, y, w, h);
+    const uint8_t r = grayPx(copy, rowBytes2, x + 1, y, w, h);
+    const uint8_t u = grayPx(copy, rowBytes2, x, y - 1, w, h);
+    const uint8_t d = grayPx(copy, rowBytes2, x, y + 1, w, h);
+    const uint8_t out = smoothPixel(c, l, r, u, d);
+    if (out != c) setGrayPx(gray, rowBytes2, x, y, out);
+  };
+  for (uint32_t x = 0; x < w; ++x) {
+    processBorder(x, 0);
+    if (h > 1) processBorder(x, h - 1);
+  }
+  for (uint32_t y = 1; y + 1 < h; ++y) {
+    processBorder(0, y);
+    if (w > 1) processBorder(w - 1, y);
+  }
+
+  // Interior: bounds are guaranteed (x in [1, w-2], y in [1, h-2]), so the
+  // neighbour reads skip the range checks; unchanged pixels (the vast majority
+  // of an AA page) also skip the write. Output is identical to the original.
+  auto pxFast = [&](const uint32_t x, const uint32_t y) -> uint8_t {
+    return static_cast<uint8_t>((copy[y * rowBytes2 + (x >> 2)] >> ((3 - (x & 3)) * 2)) & 0x3);
+  };
+  for (uint32_t y = 1; y + 1 < h; ++y) {
+    for (uint32_t x = 1; x + 1 < w; ++x) {
+      const uint8_t c = pxFast(x, y);
+      if (c == 0 && kGrayGamma[0] == 0) continue;  // white pixel: unchanged
+      const uint8_t l = pxFast(x - 1, y);
+      const uint8_t r = pxFast(x + 1, y);
+      const uint8_t u = pxFast(x, y - 1);
+      const uint8_t d = pxFast(x, y + 1);
+      const uint8_t out = smoothPixel(c, l, r, u, d);
+      if (out != c) setGrayPx(gray, rowBytes2, x, y, out);
     }
   }
-  free(copy);
 }
 
 void GfxRenderer::exportGrayFrameToBw() const {
