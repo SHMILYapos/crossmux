@@ -2,6 +2,8 @@
 
 #include <iterator>
 
+#include "CrossPointSettings.h"
+
 std::vector<uint8_t> readerFontPointSizes(const SdCardFontRegistry* registry, const char* sdFamilyName) {
   if (registry && sdFamilyName && sdFamilyName[0] != '\0') {
     if (const auto* family = registry->findFamily(sdFamilyName)) {

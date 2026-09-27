@@ -14,6 +14,7 @@
 #include "EpubReaderMenuActivity.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
+#include "Memory.h"
 #include "ReaderFontPreview.h"
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
@@ -194,6 +195,25 @@ class EpubReaderActivity final : public ReaderActivity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
+
+  // Single-pass gray prerender: after a grayscale commit the reader lays out
+  // the next page of the same section into a spare 2-bit frame, so the next
+  // flip can skip the layout walk entirely. The frame is keyed by spine/page
+  // and a fingerprint of every setting that changes layout; any mismatch
+  // (style change, chapter edge, allocation failure, switch pending) simply
+  // falls back to the normal render path.
+  void drawGuideLinesFor(Page* page, int fontId, int ml, int mt, int mr, int mb) const;
+  void renderBodyToTwoBitFrame(Page* page, uint8_t* buf, int fontId, int ml, int mt, int mr, int mb) const;
+  void prerenderNextPage(int fontId, int ml, int mt, int mr, int mb);
+  uint32_t readerRenderSettingsFingerprint() const;
+  memory::ByteBuffer prerenderBuf_;
+  uint32_t prerenderBufBytes_ = 0;
+  int prerenderSpineIndex_ = -1;
+  int prerenderPage_ = -1;
+  uint32_t prerenderFingerprint_ = 0;
+  bool prerenderValid_ = false;
+  bool prerenderInProgress_ = false;
+
   void applyOrientation(uint8_t orientation);
   void applyInitialOrientation() override;
   // The orientation the current layout was built for. The control center's
@@ -201,6 +221,10 @@ class EpubReaderActivity final : public ReaderActivity {
   // the activity stack, and Pop restores it without onEnter(), so the drift has
   // to be noticed here rather than assumed away.
   uint8_t appliedOrientation = 0;
+  // One-shot latch for tap-zone long-press actions: the hold keeps reporting
+  // for as long as the finger stays down, and this flag makes sure the
+  // bookmark/dictionary action fires exactly once, re-arming on release.
+  bool touchHoldHandled = false;
 
   bool loadBook() override;
   std::string getBookTitle() const override { return epub ? epub->getTitle() : ""; }
